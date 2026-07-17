@@ -442,6 +442,97 @@ async def post_tweet(payload: TweetRequest, _: str = Depends(verify_api_key)):
         return TweetResponse(success=False, error=error_str)
 
 
+
+class FollowRequest(BaseModel):
+    screen_name: str
+
+class FollowResponse(BaseModel):
+    success: bool
+    name: str = ""
+    following: bool = False
+    error: str = ""
+    rate_limit_remaining: int = 0
+    rate_limit_reset: int = 0
+
+@app.post("/follow", response_model=FollowResponse)
+async def follow_user(req: FollowRequest, _: str = Depends(verify_api_key)):
+    """Follow a user by screen_name."""
+    from urllib.parse import urlencode
+    import time
+    
+    sn = req.screen_name.strip().lstrip("@")
+    proxies = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_URL else None
+    
+    USER_BY_SCREEN_QID = "IGgvgiOx4QZndDHuD3x9TQ"
+    lookup_path = f"/i/api/graphql/{USER_BY_SCREEN_QID}/UserByScreenName"
+    
+    async with AsyncSession(impersonate=BROWSER, proxies=proxies) as session:
+        # Step 1: Lookup user
+        params = {"variables": json.dumps({"screen_name": sn, "withSafetyModeUserFields": True})}
+        resp = await session.get(
+            f"https://x.com{lookup_path}",
+            headers=_build_headers(method="GET", path=lookup_path),
+            params=params,
+            timeout=15,
+        )
+        data = resp.json()
+        result = data.get("data", {}).get("user", {}).get("result", {})
+        if not result or result.get("__typename") != "User":
+            err = data.get("errors", [{}])[0].get("message", "User not found")
+            return FollowResponse(success=False, error=err)
+        
+        uid = result["rest_id"]
+        name = result.get("core", {}).get("name", sn)
+        
+        # Check if already following
+        if result.get("relationship_perspectives", {}).get("following"):
+            return FollowResponse(success=True, name=name, following=True)
+        
+        if result.get("privacy", {}).get("protected"):
+            return FollowResponse(success=False, name=name, error="Account is protected")
+        
+        # Step 2: Follow
+        follow_path = "/i/api/1.1/friendships/create.json"
+        async with AsyncSession(impersonate=BROWSER, proxies=proxies) as s2:
+            f_resp = await s2.post(
+                f"https://x.com{follow_path}",
+                headers=_build_headers(method="POST", path=follow_path),
+                data={"include_profile_interstitial_type": 1, "skip_status": True, "user_id": uid},
+                timeout=15,
+            )
+            
+            # Check rate limits from response headers
+            rl_remaining = int(f_resp.headers.get("x-rate-limit-remaining", 0))
+            rl_reset = int(f_resp.headers.get("x-rate-limit-reset", 0))
+            
+            if f_resp.status_code == 200:
+                fj = f_resp.json()
+                if fj.get("following"):
+                    return FollowResponse(
+                        success=True, name=name, following=True,
+                        rate_limit_remaining=rl_remaining, rate_limit_reset=rl_reset
+                    )
+                return FollowResponse(
+                    success=False, name=name, error="Follow response did not confirm",
+                    rate_limit_remaining=rl_remaining, rate_limit_reset=rl_reset
+                )
+            elif f_resp.status_code == 403:
+                return FollowResponse(
+                    success=False, name=name, error="Blocked or restricted",
+                    rate_limit_remaining=rl_remaining, rate_limit_reset=rl_reset
+                )
+            elif f_resp.status_code == 429:
+                return FollowResponse(
+                    success=False, name=name, error="Rate limited",
+                    rate_limit_remaining=0, rate_limit_reset=rl_reset
+                )
+            else:
+                return FollowResponse(
+                    success=False, name=name,
+                    error=f"HTTP {f_resp.status_code}: {f_resp.text[:200]}",
+                    rate_limit_remaining=rl_remaining, rate_limit_reset=rl_reset
+                )
+
 @app.get("/health")
 async def health():
     """Health check — reports current cache state without triggering a scrape."""
